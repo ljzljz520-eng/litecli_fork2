@@ -1,13 +1,17 @@
 ## Unreleased
 
-### Features
+### Bug Fixes
 
-- Add `--readonly` and `.open --readonly` support for opening databases read-only.
+- Expand `~` in configured log file paths before opening the log.
 
 ### Internal
 
 - Add a GitHub Actions workflow to run Codex review on pull requests.
 - Drop Python 3.9 from test matrices and tooling targets.
+
+### Features
+
+- Add `--readonly` and `.open --readonly` support for opening databases read-only.
 
 ## 1.19.0 - 2026-01-30
 
