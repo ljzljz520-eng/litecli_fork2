@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Features
+
+- Add `--readonly` and `.open --readonly` support for opening databases read-only.
+
 ### Internal
 
 - Add a GitHub Actions workflow to run Codex review on pull requests.
