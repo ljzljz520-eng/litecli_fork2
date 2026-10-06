@@ -9,6 +9,7 @@ import pprint
 import re
 import shlex
 import sys
+from collections.abc import Callable
 from runpy import run_module
 from time import time
 from typing import Any
@@ -52,6 +53,11 @@ else:
 LLM_CLI_IMPORTED = cli is not None
 
 log = logging.getLogger(__name__)
+
+# Invoked immediately before an os.execv restart (e.g. ``\llm install``).
+# The process image replacement bypasses normal context-manager cleanup, so
+# hooks must flush any state (such as policy audit records) beforehand.
+before_restart_hooks: list[Callable[[], None]] = []
 
 LLM_TEMPLATE_NAME = "litecli-llm-template"
 LLM_CLI_COMMANDS: list[str] = list(cli.commands.keys()) if isinstance(cli, click.Group) else []
@@ -109,6 +115,11 @@ def run_external_cmd(
                         raise RuntimeError(f"Command {cmd} failed: {e}")
 
         if restart_cli and code == 0:
+            for hook in before_restart_hooks:
+                try:
+                    hook()
+                except Exception:
+                    log.debug("before-restart hook failed", exc_info=True)
             os.execv(original_exe, [original_exe] + original_args)
 
         if capture_output:

@@ -14,6 +14,8 @@ import click
 import sqlparse
 from configobj import ConfigObj
 
+from litecli.packages.guard.capabilities import FILESYSTEM, PROCESS
+
 from ..prompt_utils import confirm_destructive_query
 from . import export
 from .favoritequeries import FavoriteQueries
@@ -57,6 +59,7 @@ def is_pager_enabled() -> bool:
     arg_type=PARSED_QUERY,
     aliases=("\\P",),
     case_sensitive=True,
+    capabilities=frozenset({PROCESS}),
 )
 def set_pager(arg: str, **_: Any) -> list[tuple]:
     if arg:
@@ -277,7 +280,12 @@ def delete_favorite_query(arg: str, **_: Any) -> list[tuple]:
     return [(None, None, None, status)]
 
 
-@special_command("system", "system [command]", "Execute a system shell command.")
+@special_command(
+    "system",
+    "system [command]",
+    "Execute a system shell command.",
+    capabilities=frozenset({PROCESS}),
+)
 def execute_system_command(arg: str, **_: Any) -> list[tuple]:
     """Execute a system shell command."""
     usage = "Syntax: system [command].\n"
@@ -325,6 +333,7 @@ def parseargfile(arg: str) -> tuple[str, str]:
     ".output [-o] filename",
     "Append all results to an output file (overwrite using -o).",
     aliases=("tee",),
+    capabilities=frozenset({FILESYSTEM}),
 )
 def set_tee(arg: str, **_: Any) -> list[tuple]:
     global tee_file
@@ -368,6 +377,7 @@ def write_tee(output: str) -> None:
     "\\o [-o] filename",
     "Append next result to an output file (overwrite using -o).",
     aliases=("\\o", "\\once"),
+    capabilities=frozenset({FILESYSTEM}),
 )
 def set_once(arg: str, **_: Any) -> list[tuple]:
     global once_file, written_to_once_file
@@ -408,6 +418,7 @@ def unset_once_if_written() -> None:
     "\\| command",
     "Send next result to a subprocess.",
     aliases=("\\|",),
+    capabilities=frozenset({PROCESS}),
 )
 def set_pipe_once(arg: str, **_: Any) -> list[tuple]:
     global pipe_once_process, written_to_pipe_once_process
@@ -487,12 +498,17 @@ def watch_query(arg: str, **kwargs: Any) -> Generator[tuple, None, None]:
             clear_screen = True
             continue
         statement = "{0!s} {1!s}".format(current_arg, arg)
-    destructive_prompt = confirm_destructive_query(statement)
-    if destructive_prompt is False:
-        click.secho("Wise choice!")
-        raise StopIteration
-    elif destructive_prompt is True:
-        click.secho("Your call!")
+    # With the capability guard active, the watch payload was authorized when
+    # the outer plan was decided/confirmed - no second destructive prompt.
+    from ..guard.guard import current_guard
+
+    if current_guard() is None:
+        destructive_prompt = confirm_destructive_query(statement)
+        if destructive_prompt is False:
+            click.secho("Wise choice!")
+            raise StopIteration
+        elif destructive_prompt is True:
+            click.secho("Your call!")
     cur = kwargs["cur"]
     sql_list = [(sql.rstrip(";"), "> {0!s}".format(sql)) for sql in sqlparse.split(statement)]
     old_pager_enabled = is_pager_enabled()

@@ -10,6 +10,7 @@ from typing import Any, cast
 
 
 from litecli import __version__
+from litecli.packages.guard.capabilities import EXTENSION, FILESYSTEM, WRITE_DATA
 from litecli.packages.special import iocommands
 from .main import special_command, RAW_QUERY, PARSED_QUERY
 from .types import DBCursor
@@ -245,6 +246,7 @@ def status(cur: DBCursor, **_: Any) -> list[tuple]:
     "Load an extension library.",
     arg_type=PARSED_QUERY,
     case_sensitive=True,
+    capabilities=frozenset({EXTENSION}),
 )
 def load_extension(cur: DBCursor, arg: str, **_: Any) -> list[tuple]:
     args = shlex.split(arg)
@@ -291,6 +293,7 @@ def describe(cur: DBCursor, arg: str | None, **_: Any) -> list[tuple]:
     "Import data from filename into an existing table",
     arg_type=PARSED_QUERY,
     case_sensitive=True,
+    capabilities=frozenset({FILESYSTEM, WRITE_DATA}),
 )
 def import_file(cur: DBCursor, arg: str | None = None, **_: Any) -> list[tuple]:
     def split(s: str) -> list[str]:

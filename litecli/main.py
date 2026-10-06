@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import itertools
 import logging
 import os
@@ -9,10 +10,10 @@ import sys
 import threading
 import traceback
 from collections import namedtuple
+from collections.abc import Generator, Iterable
 from datetime import datetime
-from io import open
 from time import time
-from typing import Any, Generator, Iterable, Literal, TextIO, cast
+from typing import Any, Literal, TextIO, cast
 
 import click
 import sqlparse
@@ -41,10 +42,28 @@ from .key_bindings import cli_bindings
 from .lexer import LiteCliLexer
 from .packages import special
 from .packages.filepaths import dir_path_exists
+from .packages.guard.audit import AuditLog
+from .packages.guard.authorizer import AuthorizerController
+from .packages.guard.capabilities import FILESYSTEM as FILESYSTEM_CAP
+from .packages.guard.confirm import ClickConfirmer
+from .packages.guard.guard import ExecutionGuard, PolicyDenied
+from .packages.guard.plan import (
+    ORIGIN_EXECUTE,
+    ORIGIN_LLM,
+    ORIGIN_PROMPT,
+    ORIGIN_READ,
+    ORIGIN_STARTUP,
+    ORIGIN_STDIN,
+    PlanCompiler,
+    SourceOrigin,
+)
+from .packages.guard.policy import MODE_BATCH, MODE_INTERACTIVE, Policy
 from .packages.prompt_utils import confirm, confirm_destructive_query
+from .packages.special import llm as special_llm
 from .packages.special.main import NO_QUERY
 from .sqlcompleter import SQLCompleter
 from .sqlexecute import SQLExecute
+from .sqlexecute import sqlite3 as sqlite_backend
 
 
 def _load_sqlite3() -> Any:
@@ -67,7 +86,7 @@ Query = namedtuple("Query", ["query", "successful", "mutating"])
 PACKAGE_ROOT = os.path.abspath(os.path.dirname(__file__))
 
 
-class LiteCli(object):
+class LiteCli:
     default_prompt = "\\d> "
     max_len_prompt = 45
 
@@ -79,9 +98,13 @@ class LiteCli(object):
         auto_vertical_output: bool = False,
         warn: bool | None = None,
         liteclirc: str | None = None,
+        policy_mode: str | None = None,
+        guard: ExecutionGuard | None = None,
     ) -> None:
         self.sqlexecute = sqlexecute
         self.logfile: TextIO | Literal[False] | None = logfile
+        self.policy_mode_override = policy_mode
+        self.guard = guard
 
         # Load config.
         c = self.config = get_config(liteclirc)
@@ -91,7 +114,7 @@ class LiteCli(object):
         special.set_favorite_queries(self.config)
         self.formatter = TabularOutputFormatter(format_name=c["main"]["table_format"])
         # self.formatter.litecli = self, ty raises unresolved-attribute, hence use dynamic assignment
-        setattr(self.formatter, "litecli", self)
+        self.formatter.litecli = self
         self.syntax_style = c["main"]["syntax_style"]
         self.less_chatty = c["main"].as_bool("less_chatty")
         self.show_bottom_toolbar = c["main"].as_bool("show_bottom_toolbar")
@@ -109,8 +132,8 @@ class LiteCli(object):
         # audit log
         if self.logfile is None and "audit_log" in c["main"]:
             try:
-                self.logfile = open(os.path.expanduser(c["main"]["audit_log"]), "a")
-            except (IOError, OSError):
+                self.logfile = builtins.open(os.path.expanduser(c["main"]["audit_log"]), "a")
+            except OSError:
                 self.echo(
                     "Error: Unable to open the audit log file. Your queries will not be logged.",
                     err=True,
@@ -154,6 +177,7 @@ class LiteCli(object):
             ".open",
             "Change to a new database.",
             aliases=("use", "\\u"),
+            capabilities=frozenset({FILESYSTEM_CAP}),
         )
         special.register_special_command(
             self.refresh_completions,
@@ -178,6 +202,7 @@ class LiteCli(object):
             "Execute commands from file.",
             case_sensitive=True,
             aliases=("\\.", "source"),
+            capabilities=frozenset({FILESYSTEM_CAP}),
         )
         special.register_special_command(
             self.change_prompt_format,
@@ -187,15 +212,82 @@ class LiteCli(object):
             aliases=("\\R",),
             case_sensitive=True,
         )
+        special.register_special_command(
+            self.policy_audit,
+            "policyaudit",
+            "\\pa [plan_hash]",
+            "Show the policy audit trail, or verify one record by plan hash.",
+            case_sensitive=True,
+        )
+
+    def policy_audit(self, arg: str | None, **_: Any) -> Iterable[tuple[Any, ...]]:
+        """List policy audit records, or show + replay-verify one by hash."""
+        from .packages.guard.audit import replay_record
+
+        if self.guard is None:
+            return [(None, None, None, "Policy guard is not initialized.")]
+        audit_log = self.guard.audit_log
+        if not audit_log.enabled or audit_log.path is None:
+            return [(None, None, None, "Policy audit log is disabled.")]
+
+        wanted = (arg or "").strip()
+        if not wanted:
+            headers = ["ts", "plan_hash", "mode", "verdict", "outcome"]
+            rows = []
+            for record in audit_log.iter_records():
+                decision = record.get("decision", {})
+                rows.append(
+                    (
+                        record.get("ts"),
+                        str(record.get("plan_hash", ""))[:12],
+                        record.get("mode"),
+                        decision.get("verdict"),
+                        record.get("outcome"),
+                    )
+                )
+            if not rows:
+                return [(None, None, None, "No policy audit records found.")]
+            return [("Policy audit", rows, headers, "{} record{}".format(len(rows), "" if len(rows) == 1 else "s"))]
+
+        records = audit_log.find_by_hash(wanted)
+        if not records:
+            # Treat the argument as a hash prefix for convenience.
+            records = [r for r in audit_log.iter_records() if str(r.get("plan_hash", "")).startswith(wanted)]
+        if not records:
+            return [(None, None, None, f"No audit record for plan hash {wanted}")]
+
+        output: list[tuple[Any, ...]] = []
+        for record in records:
+            result = replay_record(record)
+            status = "MATCH" if result.ok else "MISMATCH"
+            output.append(
+                (
+                    None,
+                    [
+                        ("plan_hash", record.get("plan_hash")),
+                        ("mode", record.get("mode")),
+                        ("outcome", record.get("outcome")),
+                        ("recorded_verdict", result.recorded_verdict),
+                        ("replayed_verdict", result.replayed_verdict),
+                        ("hash_ok", result.hash_ok),
+                        ("verdict_match", result.verdict_match),
+                        ("rules_snapshot_ok", "n/a" if result.snapshot_ok is None else result.snapshot_ok),
+                        ("status", status),
+                    ],
+                    ["field", "value"],
+                    None,
+                )
+            )
+        return output
 
     def change_table_format(self, arg: str, **_: Any) -> Generator[tuple[None, None, None, str], None, None]:
         try:
             self.formatter.format_name = arg
-            yield (None, None, None, "Changed table format to {}".format(arg))
+            yield (None, None, None, f"Changed table format to {arg}")
         except ValueError:
-            msg = "Table format {} not recognized. Allowed formats:".format(arg)
+            msg = f"Table format {arg} not recognized. Allowed formats:"
             for table_type in self.formatter.supported_formats:
-                msg += "\n\t{}".format(table_type)
+                msg += f"\n\t{table_type}"
             yield (None, None, None, msg)
 
     def change_db(self, arg: str | None, **_: Any) -> Iterable[tuple]:
@@ -222,17 +314,20 @@ class LiteCli(object):
             message = "Missing required argument, filename."
             return [(None, None, None, message)]
         try:
-            with open(os.path.expanduser(arg), encoding="utf-8") as f:
+            with builtins.open(os.path.expanduser(arg), encoding="utf-8") as f:
                 query = f.read()
-        except IOError as e:
+        except OSError as e:
             return [(None, None, None, str(e))]
 
-        if self.destructive_warning and confirm_destructive_query(query) is False:
+        guard_active = self.guard is not None and self.guard.enabled
+        if self.destructive_warning and not guard_active and confirm_destructive_query(query) is False:
             message = "Wise choice. Command execution stopped."
             return [(None, None, None, message)]
 
         assert self.sqlexecute is not None
-        return cast(Iterable[tuple[Any, ...]], self.sqlexecute.run(query))
+        parent = self.guard.current_origin if self.guard is not None else None
+        origin = SourceOrigin(ORIGIN_READ, parent=parent)
+        return cast(Iterable[tuple[Any, ...]], self.sqlexecute.run(query, origin=origin))
 
     def change_prompt_format(self, arg: str | None, **_: Any) -> Iterable[tuple]:
         """
@@ -275,7 +370,7 @@ class LiteCli(object):
             handler = logging.FileHandler(log_file)
         else:
             self.echo(
-                'Error: Unable to open the log file "{}".'.format(log_file),
+                f'Error: Unable to open the log file "{log_file}".',
                 err=True,
                 fg="red",
             )
@@ -314,6 +409,37 @@ class LiteCli(object):
 
         return {x: get(x) for x in keys}
 
+    @property
+    def policy_mode(self) -> str:
+        if self.policy_mode_override in (MODE_INTERACTIVE, MODE_BATCH):
+            return cast(str, self.policy_mode_override)
+        return MODE_INTERACTIVE if sys.stdin.isatty() else MODE_BATCH
+
+    def init_guard(self) -> None:
+        """Build the capability guard from the [policy] config section."""
+        if self.guard is not None:
+            return
+        section = self.config.get("policy", {}) if hasattr(self, "config") else {}
+        policy = Policy.from_config(section, destructive_warning=self.destructive_warning)
+        controller = AuthorizerController(sqlite_backend, network_functions=policy.network_functions, enabled=policy.enabled)
+        audit_log = AuditLog.from_setting(section.get("audit_log"))
+        confirmer = ClickConfirmer() if self.policy_mode == MODE_INTERACTIVE else None
+        compiler = PlanCompiler(
+            network_functions=policy.network_functions,
+            max_nest_depth=policy.max_nest_depth,
+        )
+        self.guard = ExecutionGuard(
+            compiler=compiler,
+            policy=policy,
+            controller=controller,
+            audit_log=audit_log,
+            confirmer=confirmer,
+            mode=self.policy_mode,
+        )
+        # \llm install/uninstall replaces the process image via os.execv on
+        # success; flush the in-flight audit record before that happens.
+        special_llm.before_restart_hooks.append(self.guard.flush_active_for_restart)
+
     def connect(self, database: str | None = "") -> None:
         cnf: dict[str, str | None] = {"database": None}
 
@@ -326,7 +452,9 @@ class LiteCli(object):
         # Connect to the database.
 
         def _connect() -> None:
-            self.sqlexecute = SQLExecute(db_value)
+            self.init_guard()
+            assert self.guard is not None
+            self.sqlexecute = SQLExecute(db_value, guard=self.guard)
 
         try:
             _connect()
@@ -384,7 +512,7 @@ class LiteCli(object):
         else:
             history = None
             self.echo(
-                'Error: Unable to open the history file "{}". Your query history will not be saved.'.format(history_file),
+                f'Error: Unable to open the history file "{history_file}". Your query history will not be saved.',
                 err=True,
                 fg="red",
             )
@@ -419,7 +547,7 @@ class LiteCli(object):
                 threshold = 1000
                 if is_select(status) and cur and cur.rowcount > threshold:
                     self.echo(
-                        "The result set has more than {} rows.".format(threshold),
+                        f"The result set has more than {threshold} rows.",
                         fg="red",
                     )
                     if not confirm("Do you want to continue?"):
@@ -452,6 +580,8 @@ class LiteCli(object):
             return mutating
 
         def one_iteration(text: str | None = None) -> None:
+            origin = SourceOrigin(ORIGIN_PROMPT)
+            from_llm = False
             if text is None:
                 try:
                     assert self.prompt_app is not None
@@ -461,29 +591,69 @@ class LiteCli(object):
 
                 special.set_expanded_output(False)
 
-                try:
-                    text = self.handle_editor_command(text)
-                except RuntimeError as e:
-                    logger.error("sql: %r, error: %r", text, e)
-                    logger.error("traceback: %r", traceback.format_exc())
-                    self.echo(str(e), err=True, fg="red")
-                    return
+                if self.guard is not None and self.guard.enabled and special.editor_command(text):
+                    # The external editor spawns a process and may touch temp
+                    # files. \e is a prefix/suffix marker rather than a leading
+                    # command, so gate the editor itself via its canonical
+                    # name; the edited SQL is gated again when it actually runs.
+                    try:
+                        prepared = self.guard.prepare("\\e", origin)
+                    except PolicyDenied as e:
+                        self.echo(str(e), err=True, fg="red")
+                        return
+                    with self.guard.scope(prepared):
+                        try:
+                            text = self.handle_editor_command(text)
+                        except RuntimeError as e:
+                            logger.error("sql: %r, error: %r", text, e)
+                            logger.error("traceback: %r", traceback.format_exc())
+                            self.echo(str(e), err=True, fg="red")
+                            return
+                else:
+                    try:
+                        text = self.handle_editor_command(text)
+                    except RuntimeError as e:
+                        logger.error("sql: %r, error: %r", text, e)
+                        logger.error("traceback: %r", traceback.format_exc())
+                        self.echo(str(e), err=True, fg="red")
+                        return
 
                 while special.is_llm_command(text):
+                    guard = self.guard
+                    if guard is not None and guard.enabled:
+                        # handle_llm spawns the llm CLI (process+network);
+                        # decide before the subprocess is ever started.
+                        try:
+                            llm_prepared = guard.prepare(text, origin)
+                        except PolicyDenied as e:
+                            self.echo(str(e), err=True, fg="red")
+                            text = ""
+                            break
+                    else:
+                        llm_prepared = None
                     try:
                         start = time()
                         assert self.sqlexecute is not None
                         conn = self.sqlexecute.conn
                         assert conn is not None
                         cur = conn.cursor()
-                        context, sql, duration = special.handle_llm(text, cur)
+                        if llm_prepared is not None:
+                            assert guard is not None
+                            with guard.scope(llm_prepared):
+                                context, sql, duration = special.handle_llm(text, cur)
+                        else:
+                            context, sql, duration = special.handle_llm(text, cur)
                         if context:
                             click.echo("LLM Reponse:")
                             click.echo(context)
                             click.echo("---")
                         click.echo(f"Time: {duration:.2f} seconds")
                         assert self.prompt_app is not None
-                        text = self.prompt_app.prompt(default=sql)
+                        edited = self.prompt_app.prompt(default=sql)
+                        # Unedited LLM output keeps the llm origin; once the
+                        # user edits it, it is ordinary prompt input.
+                        from_llm = edited == sql
+                        text = edited
                     except KeyboardInterrupt:
                         return
                     except special.FinishIteration as e:
@@ -499,7 +669,11 @@ class LiteCli(object):
             if not text.strip():
                 return
 
-            if self.destructive_warning:
+            if from_llm:
+                origin = SourceOrigin(ORIGIN_LLM)
+
+            guard_active = self.guard is not None and self.guard.enabled
+            if self.destructive_warning and not guard_active:
                 destroy = confirm_destructive_query(text)
                 if destroy is None:
                     pass  # Query was not destructive. Nothing to do here.
@@ -522,9 +696,9 @@ class LiteCli(object):
 
                 successful = False
                 start = time()
-                res = sqlexecute.run(text)
+                res = sqlexecute.run(text, origin=origin)
                 # Set query attribute dynamically on formatter
-                setattr(self.formatter, "query", text)
+                self.formatter.query = text
                 successful = True
                 special.unset_once_if_written()
                 # Keep track of whether or not the query is mutating. In case
@@ -532,6 +706,9 @@ class LiteCli(object):
                 # mutating if any one of the component statements is mutating
                 mutating = output_res(res, start)
                 special.unset_pipe_once_if_written()
+            except PolicyDenied as e:
+                logger.debug("Policy denial: %s", e)
+                self.echo(str(e), err=True, fg="red")
             except EOFError as e:
                 raise e
             except KeyboardInterrupt:
@@ -542,7 +719,7 @@ class LiteCli(object):
                         conn.interrupt()  # type: ignore[attr-defined]
                 except Exception as e:
                     self.echo(
-                        "Encountered error while cancelling query: {}".format(e),
+                        f"Encountered error while cancelling query: {e}",
                         err=True,
                         fg="red",
                     )
@@ -638,7 +815,11 @@ class LiteCli(object):
                         commands = self.startup_commands["commands"]
                     for command in commands:
                         try:
-                            res = sqlexecute.run(command)
+                            res = sqlexecute.run(command, origin=SourceOrigin(ORIGIN_STARTUP))
+                        except PolicyDenied as e:
+                            click.echo(command)
+                            self.echo(str(e), err=True, fg="red")
+                            continue
                         except Exception as e:
                             click.echo(command)
                             self.echo(str(e), err=True, fg="red")
@@ -818,7 +999,7 @@ class LiteCli(object):
             r"\_": " ",
         }
         # Compile a regex pattern that matches any of the keys in replacements
-        pattern = re.compile("|".join(re.escape(key) for key in replacements.keys()))
+        pattern = re.compile("|".join(re.escape(key) for key in replacements))
 
         # Define the replacement function
         def replacer(match: re.Match[str]) -> str:
@@ -827,13 +1008,13 @@ class LiteCli(object):
         # Perform the substitution
         return pattern.sub(replacer, string)
 
-    def run_query(self, query: str, new_line: bool = True) -> None:
+    def run_query(self, query: str, new_line: bool = True, origin: SourceOrigin | None = None) -> None:
         """Runs *query*."""
         assert self.sqlexecute is not None
-        results = self.sqlexecute.run(query)
+        results = self.sqlexecute.run(query, origin=origin or SourceOrigin(ORIGIN_EXECUTE))
         for result in results:
             title, cur, headers, status = result
-            setattr(self.formatter, "query", query)
+            self.formatter.query = query
             output = self.format_output(title, cur, headers)
             for line in output:
                 click.echo(line, nl=new_line)
@@ -910,7 +1091,7 @@ class LiteCli(object):
     "-R",
     "--prompt",
     "prompt",
-    help='Prompt format (Default: "{0}").'.format(LiteCli.default_prompt),
+    help=f'Prompt format (Default: "{LiteCli.default_prompt}").',
 )
 @click.option(
     "-l",
@@ -932,6 +1113,13 @@ class LiteCli(object):
 @click.option("-t", "--table", is_flag=True, help="Display batch output in table format.")
 @click.option("--csv", is_flag=True, help="Display batch output in CSV format.")
 @click.option("--warn/--no-warn", default=None, help="Warn before running a destructive query.")
+@click.option(
+    "--policy-mode",
+    "policy_mode",
+    type=click.Choice(["auto", "interactive", "batch"]),
+    default="auto",
+    help="Capability policy mode: confirm interactively or deny dangerous operations in batch (default: auto).",
+)
 @click.option("-e", "--execute", type=str, help="Execute command and quit.")
 @click.argument("database", default="", nargs=1)
 def cli(
@@ -943,6 +1131,7 @@ def cli(
     table: bool,
     csv: bool,
     warn: bool | None,
+    policy_mode: str,
     execute: str | None,
     liteclirc: str,
 ) -> None:
@@ -953,12 +1142,17 @@ def cli(
       - litecli lite_database
 
     """
+    resolved_mode = policy_mode
+    if resolved_mode == "auto":
+        resolved_mode = MODE_INTERACTIVE if (not execute and sys.stdin.isatty()) else MODE_BATCH
+
     litecli = LiteCli(
         prompt=prompt,
         logfile=logfile,
         auto_vertical_output=auto_vertical_output,
         warn=warn,
         liteclirc=liteclirc,
+        policy_mode=resolved_mode,
     )
 
     # Choose which ever one has a valid value.
@@ -976,7 +1170,7 @@ def cli(
             elif not table:
                 litecli.formatter.format_name = "tsv"
 
-            litecli.run_query(execute)
+            litecli.run_query(execute, origin=SourceOrigin(ORIGIN_EXECUTE))
             exit(0)
         except Exception as e:
             click.secho(str(e), err=True, fg="red")
@@ -989,11 +1183,12 @@ def cli(
         stdin_text = stdin.read()
 
         try:
-            sys.stdin = open("/dev/tty")
+            sys.stdin = builtins.open("/dev/tty")
         except (FileNotFoundError, OSError):
             litecli.logger.warning("Unable to open TTY as stdin.")
 
-        if litecli.destructive_warning and confirm_destructive_query(stdin_text) is False:
+        guard_active = litecli.guard is not None and litecli.guard.enabled
+        if litecli.destructive_warning and not guard_active and confirm_destructive_query(stdin_text) is False:
             exit(0)
         try:
             new_line = True
@@ -1003,7 +1198,7 @@ def cli(
             elif not table:
                 litecli.formatter.format_name = "tsv"
 
-            litecli.run_query(stdin_text, new_line=new_line)
+            litecli.run_query(stdin_text, new_line=new_line, origin=SourceOrigin(ORIGIN_STDIN))
             exit(0)
         except Exception as e:
             click.secho(str(e), err=True, fg="red")

@@ -1,8 +1,21 @@
 ## Unreleased
 
+### Features
+
+- Add a unified capability policy guard: every execution (prompt, `.read`, startup, favorite, LLM, `-e`, stdin) is compiled into an `ExecutionPlan`, decided against capability rules (`filesystem`, `process`, `extension`, `network`, `write-schema`, `write-data`) for interactive/batch mode, confirmed once with the real side effects shown, and enforced by a SQLite authorizer installed on every connection. Works with both stdlib `sqlite3` and sqlean.
+- Add `policyaudit` special command (`\pa [plan_hash]`) to inspect the redacted JSONL audit trail and replay/verify decisions by plan hash.
+- Add `--policy-mode {auto,interactive,batch}` and a `[policy]` config section for verdicts, network function names, nest depth and audit log location.
+
+### Behavior Changes
+
+- Dangerous operations that would be confirmed interactively are denied in batch mode (`-e`/piped stdin) instead of running; denials name the hit capability and rule and are enforced before any side effect.
+- `.read`/favorite/LLM-sourced statements now follow the same policy as prompt input; sources are recorded in the audit but never grant extra authority.
+
 ### Bug Fixes
 
 - Expand `~` in configured log file paths before opening the log.
+- Gate sqlean `fileio_*`/`lsdir`/`scanfile` file functions and file-backed virtual table modules (`vsv`, ...), `.import` runtime INSERTs, and the `\llm`/`\e` commands through the same capability policy as regular SQL.
+- Mask double-quoted literals and SQL comments in normalized plan templates so they cannot reach the audit trail.
 
 ### Internal
 

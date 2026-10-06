@@ -132,3 +132,32 @@ output.even-row = ""
 # they will be executed in the same order as they appear in the list.
 [startup_commands]
 #commands = ".tables", "pragma foreign_keys = ON;"
+
+# Capability policy guard.
+# Every execution is compiled into an ExecutionPlan, checked against this
+# policy and enforced at the SQLite authorizer layer. The same dangerous
+# operation gets the same verdict whether it comes from the prompt, .read,
+# startup commands, a favorite, the LLM integration, -e or stdin.
+#
+# Verdicts: allow | confirm | deny, given as "interactive,batch".
+# In interactive mode "confirm" asks once for the whole plan; in batch mode
+# there is no prompt, so the batch verdict applies (normally deny).
+[policy]
+# enabled = True
+# filesystem = confirm, deny
+# process = confirm, deny
+# extension = confirm, deny
+# network = confirm, deny
+# write_schema = confirm, deny
+# CREATE is allowed by default (only the generic write-schema verdict above
+# covers DROP/ALTER/writable_schema).
+# write_schema_create = allow, allow
+# write_data = allow, allow
+# Comma-separated extra SQL function names that imply network access.
+# network_functions =
+# Maximum .read nesting depth before a plan is rejected as unresolved.
+# max_nest_depth = 8
+# JSONL audit trail: "default" (config dir/policy-audit.jsonl), a path,
+# or "off"/"none" to disable. Records never contain raw SQL or literal
+# values - only normalized templates and capability classifications.
+# audit_log = default

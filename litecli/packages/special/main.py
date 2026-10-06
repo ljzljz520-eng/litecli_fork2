@@ -4,6 +4,11 @@ from collections import namedtuple
 from enum import Enum
 from typing import Any, Callable, cast
 
+from litecli.packages.guard.capabilities import (
+    FILESYSTEM as FILESYSTEM_CAP,
+    NETWORK as NETWORK_CAP,
+    PROCESS as PROCESS_CAP,
+)
 from . import export
 
 log = logging.getLogger(__name__)
@@ -29,8 +34,10 @@ SpecialCommand = namedtuple(
         "arg_type",
         "hidden",
         "case_sensitive",
+        "capabilities",
     ],
 )
+SpecialCommand.__new__.__defaults__ = (frozenset(),)
 
 COMMANDS = {}
 
@@ -79,6 +86,7 @@ def special_command(
     hidden: bool = False,
     case_sensitive: bool = False,
     aliases: tuple[str, ...] = (),
+    capabilities: frozenset[str] = frozenset(),
 ) -> Callable:
     def wrapper(wrapped: Callable) -> Callable:
         register_special_command(
@@ -90,6 +98,7 @@ def special_command(
             hidden,
             case_sensitive,
             aliases,
+            capabilities,
         )
         return wrapped
 
@@ -106,9 +115,10 @@ def register_special_command(
     hidden: bool = False,
     case_sensitive: bool = False,
     aliases: tuple[str, ...] = (),
+    capabilities: frozenset[str] = frozenset(),
 ) -> None:
     cmd = command.lower() if not case_sensitive else command
-    COMMANDS[cmd] = SpecialCommand(handler, command, shortcut, description, arg_type, hidden, case_sensitive)
+    COMMANDS[cmd] = SpecialCommand(handler, command, shortcut, description, arg_type, hidden, case_sensitive, capabilities)
     for alias in aliases:
         cmd = alias.lower() if not case_sensitive else alias
         COMMANDS[cmd] = SpecialCommand(
@@ -119,7 +129,32 @@ def register_special_command(
             arg_type,
             case_sensitive=case_sensitive,
             hidden=True,
+            capabilities=capabilities,
         )
+
+
+@export
+def command_capabilities(command: str) -> frozenset[str]:
+    """Return capabilities declared for *command* (alias aware).
+
+    Returns an empty frozenset for unknown commands, letting callers treat
+    unrecognized input as SQL rather than as a capability decision.
+    """
+    special_cmd = lookup_command(command)
+    if special_cmd is None:
+        return frozenset()
+    return special_cmd.capabilities
+
+
+@export
+def lookup_command(command: str) -> SpecialCommand | None:
+    """Find the registered command (alias aware), honoring case sensitivity."""
+    special_cmd = COMMANDS.get(command)
+    if special_cmd is None:
+        special_cmd = COMMANDS.get(command.lower())
+        if special_cmd is not None and special_cmd.case_sensitive:
+            return None
+    return special_cmd
 
 
 @export
@@ -175,6 +210,7 @@ def quit(*_args: Any) -> None:
     "Edit command with editor (uses $EDITOR).",
     arg_type=NO_QUERY,
     case_sensitive=True,
+    capabilities=frozenset({PROCESS_CAP, FILESYSTEM_CAP}),
 )
 @special_command(
     "\\G",
@@ -187,15 +223,18 @@ def stub() -> None:
     raise NotImplementedError
 
 
-if LLM_IMPORTED:
-
-    @special_command(
-        "\\llm",
-        "\\ai",
-        "Use LLM to construct a SQL query.",
-        arg_type=NO_QUERY,
-        case_sensitive=False,
-        aliases=(".ai", ".llm"),
-    )
-    def llm_stub() -> None:
-        raise NotImplementedError
+# Declared unconditionally so the planner can gate it even when the optional
+# llm package is absent. The real handler runs in main.py (never via
+# special.execute); hidden keeps it out of help when the package is missing.
+@special_command(
+    "\\llm",
+    "\\ai",
+    "Use LLM to construct a SQL query.",
+    arg_type=NO_QUERY,
+    case_sensitive=False,
+    hidden=not LLM_IMPORTED,
+    aliases=("\\ai", ".ai", ".llm"),
+    capabilities=frozenset({PROCESS_CAP, NETWORK_CAP}),
+)
+def llm_stub() -> None:
+    raise NotImplementedError

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import os.path
+from collections.abc import Generator, Iterable
 from contextlib import closing
-from typing import Any, Generator, Iterable, cast
+from typing import Any, cast
 from urllib.parse import urlparse
 
 import sqlparse
@@ -16,6 +17,8 @@ except ImportError:
     import sqlite3 as _sqlite3
 
 from litecli.packages import special
+from litecli.packages.guard.guard import ExecutionGuard, PreparedExecution
+from litecli.packages.guard.plan import ORIGIN_EXECUTE, SourceOrigin
 from litecli.packages.special.utils import check_if_sqlitedotcommand
 
 sqlite3 = cast(Any, _sqlite3)
@@ -29,7 +32,7 @@ _logger = logging.getLogger(__name__)
 # })
 
 
-class SQLExecute(object):
+class SQLExecute:
     databases_query = """
         PRAGMA database_list
     """
@@ -59,11 +62,12 @@ class SQLExecute(object):
     functions_query = '''SELECT ROUTINE_NAME FROM INFORMATION_SCHEMA.ROUTINES
     WHERE ROUTINE_TYPE="FUNCTION" AND ROUTINE_SCHEMA = "%s"'''
 
-    def __init__(self, database: str | None):
+    def __init__(self, database: str | None, guard: ExecutionGuard | None = None):
         self.dbname: str | None = database
         self._server_type: tuple[str, str] | None = None
         # Connection can be sqlite3.Connection or sqlean.sqlite3 connection.
         self.conn: Any | None = None
+        self.guard = guard
         if not database:
             _logger.debug("Database is not specified. Skip connection.")
             return
@@ -86,7 +90,7 @@ class SQLExecute(object):
             db_filename = db_name = os.path.expanduser(db)
             db_dir_name = os.path.dirname(os.path.abspath(db_filename))
             if not os.path.exists(db_dir_name):
-                raise Exception("Path does not exist: {}".format(db_dir_name))
+                raise Exception(f"Path does not exist: {db_dir_name}")
 
         conn = sqlite3.connect(database=db_name, isolation_level=None, uri=uri)
         conn.text_factory = lambda x: x.decode("utf-8", "backslashreplace")
@@ -94,57 +98,69 @@ class SQLExecute(object):
             self.conn.close()
 
         self.conn = conn
+        if self.guard is not None:
+            self.guard.attach_connection(conn)
         # Update them after the connection is made to ensure that it was a
         # successful connection.
         self.dbname = db_filename
 
-    def run(self, statement: str) -> Iterable[tuple]:
+    def run(self, statement: str, origin: SourceOrigin | None = None) -> Iterable[tuple]:
         """Execute the sql in the database and return the results. The results
         are a list of tuples. Each tuple has 4 values
         (title, rows, headers, status).
+
+        With a guard attached, compilation, policy decision and confirmation
+        happen eagerly (before the first iteration of the returned generator),
+        so a denial never races with a side effect.
         """
-        # Remove spaces and EOL
         statement = statement.strip()
+        if self.guard is None or not self.guard.enabled:
+            return self._run_legacy(statement)
+
+        if origin is None:
+            origin = SourceOrigin(ORIGIN_EXECUTE, parent=self.guard.current_origin)
+        # Raises PolicyDenied before any generator body runs.
+        prepared = self.guard.prepare(statement, origin)
+        return self._run_guarded(statement, prepared)
+
+    def _split_components(self, statement: str) -> list[tuple[str, bool]]:
+        """Return [(sql, expanded_output)] mirroring the legacy splitting."""
+        if statement.startswith("\\fs"):
+            raw_components = [statement]
+        else:
+            raw_components = sqlparse.split(statement)
+        components: list[tuple[str, bool]] = []
+        for component in raw_components:
+            sql = component.rstrip(";")
+            expanded = False
+            # \G is treated specially since we have to set the expanded output.
+            if sql.endswith("\\G"):
+                expanded = True
+                sql = sql[:-2].strip()
+            if sql.strip():
+                components.append((sql.strip(), expanded))
+        return components
+
+    @staticmethod
+    def _runs_without_connection(sql: str) -> bool:
+        return sql.lower().startswith("use") or sql.startswith((".open", "\\u", "\\?", "\\q", "help", "exit", "quit"))
+
+    def _run_legacy(self, statement: str) -> Iterable[tuple]:
         if not statement:  # Empty string
             yield (None, None, None, None)
 
-        # Split the sql into separate queries and run each one.
-        # Unless it's saving a favorite query, in which case we
-        # want to save them all together.
-        if statement.startswith("\\fs"):
-            components = [statement]
-        else:
-            components = sqlparse.split(statement)
-
-        for sql in components:
-            # Remove spaces, eol and semi-colons.
-            sql = sql.rstrip(";")
-
-            # \G is treated specially since we have to set the expanded output.
-            if sql.endswith("\\G"):
+        for sql, expanded in self._split_components(statement):
+            if expanded:
                 special.set_expanded_output(True)
-                sql = sql[:-2].strip()
 
-            if not self.conn and not (
-                sql.startswith(".open")
-                or sql.lower().startswith("use")
-                or sql.startswith("\\u")
-                or sql.startswith("\\?")
-                or sql.startswith("\\q")
-                or sql.startswith("help")
-                or sql.startswith("exit")
-                or sql.startswith("quit")
-            ):
+            if not self.conn and not self._runs_without_connection(sql):
                 _logger.debug("Not connected to database. Will not run statement: %s.", sql)
                 raise OperationalError("Not connected to database.")
-                # yield ('Not connected to database', None, None, None)
-                # return
 
             cur = self.conn.cursor() if self.conn else None
             try:  # Special command
                 _logger.debug("Trying a dbspecial command. sql: %r", sql)
-                for result in special.execute(cur, sql):
-                    yield result
+                yield from special.execute(cur, sql)
             except special.CommandNotFound:  # Regular SQL
                 if check_if_sqlitedotcommand(sql):
                     yield ("dot command not implemented", None, None, None)
@@ -153,6 +169,41 @@ class SQLExecute(object):
                     assert cur is not None
                     cur.execute(sql)
                     yield self.get_result(cur)
+
+    def _run_guarded(self, statement: str, prepared: PreparedExecution) -> Iterable[tuple]:
+        guard = self.guard
+        assert guard is not None
+        roots = [entry for entry in prepared.plan.entries if entry.is_root]
+        components = self._split_components(statement)
+        if not components:
+            yield (None, None, None, None)
+            return
+        if len(roots) != len(components):
+            # Should never happen: compiler and runner share the same splitter.
+            raise RuntimeError("plan root entries do not match executed statements")
+
+        with guard.scope(prepared):
+            for entry, (sql, expanded) in zip(roots, components):
+                if expanded:
+                    special.set_expanded_output(True)
+
+                if not self.conn and not self._runs_without_connection(sql):
+                    _logger.debug("Not connected to database. Will not run statement: %s.", sql)
+                    raise OperationalError("Not connected to database.")
+
+                guard.authorize_entry(entry)
+                cur = self.conn.cursor() if self.conn else None
+                try:  # Special command
+                    _logger.debug("Trying a dbspecial command. sql: %r", sql)
+                    yield from special.execute(cur, sql)
+                except special.CommandNotFound:  # Regular SQL
+                    if check_if_sqlitedotcommand(sql):
+                        yield ("dot command not implemented", None, None, None)
+                    else:
+                        _logger.debug("Regular sql statement. sql: %r", sql)
+                        assert cur is not None
+                        cur.execute(sql)
+                        yield self.get_result(cur)
 
     def get_result(self, cursor: Any) -> tuple[str | None, list | None, list | None, str]:
         """Get the current result's data from the cursor."""
